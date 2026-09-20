@@ -8,10 +8,18 @@ import {
   summarize,
   type Resolution,
 } from './lib/merge';
-import { SAMPLE_DOCS } from './lib/sample';
-import { loadState, saveState } from './lib/storage';
+import { SAMPLE_DOCS, SAMPLE_FACTS_DOCS } from './lib/sample';
+import { loadState, saveState, PERSIST_HISTORY_LIMIT, type WorkSnapshot } from './lib/storage';
 import { splitParagraphs } from './lib/text';
-import { buildBaseView, buildSideView } from './lib/viewmodel';
+import {
+  applyCandidateToDocs,
+  effectiveAcks,
+  verifyFacts,
+  type FactIssue,
+  type SyncCandidate,
+} from './lib/verify';
+import { buildBaseView, buildSideView, refsLabel } from './lib/viewmodel';
+import { FactPanel } from './components/FactPanel';
 import { MergedPane } from './components/MergedPane';
 import { SourcePane } from './components/SourcePane';
 
@@ -21,25 +29,32 @@ interface Docs {
   legal: string;
 }
 
-interface WorkState {
-  docs: Docs;
-  resolutions: Record<string, Resolution>;
-}
+type WorkState = WorkSnapshot;
 
-function initialState(): WorkState {
+function initialHistory(): History<WorkState> {
   const persisted = loadState();
-  if (persisted) return { docs: persisted.docs, resolutions: persisted.resolutions };
-  return { docs: SAMPLE_DOCS, resolutions: {} };
+  if (persisted) {
+    return {
+      past: persisted.past,
+      present: { docs: persisted.docs, resolutions: persisted.resolutions, acks: persisted.acks },
+      future: persisted.future,
+    };
+  }
+  return initHistory({ docs: SAMPLE_DOCS, resolutions: {}, acks: {} });
 }
 
 export default function App() {
-  const [history, setHistory] = useState<History<WorkState>>(() => initHistory(initialState()));
+  const [history, setHistory] = useState<History<WorkState>>(initialHistory);
   const state = history.present;
 
-  // 本地持久化
+  // 本地持久化：文档（比较基线）、决议、事实确认与撤销/重做历史
   useEffect(() => {
-    saveState(state);
-  }, [state]);
+    saveState({
+      ...state,
+      past: history.past.slice(-PERSIST_HISTORY_LIMIT),
+      future: history.future.slice(0, PERSIST_HISTORY_LIMIT),
+    });
+  }, [history, state]);
 
   const commitState = useCallback((next: WorkState) => {
     setHistory((h) => commit(h, next));
@@ -61,6 +76,25 @@ export default function App() {
     [paras, state.resolutions],
   );
   const summary = useMemo(() => summarize(entries), [entries]);
+
+  // —— 事实完整性校核（合并后验证全部关系） ——
+  const factReport = useMemo(() => verifyFacts(paras, entries), [paras, entries]);
+  const acks = useMemo(() => effectiveAcks(state.acks, factReport.issues), [state.acks, factReport]);
+  const pendingIssues = useMemo(
+    () => factReport.issues.filter((i) => acks[i.ackKey] === undefined),
+    [factReport, acks],
+  );
+  const ackedIssues = useMemo(
+    () => factReport.issues.filter((i) => acks[i.ackKey] !== undefined),
+    [factReport, acks],
+  );
+  const entryIssueCount = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const issue of pendingIssues) {
+      for (const id of issue.entryIds) map.set(id, (map.get(id) ?? 0) + 1);
+    }
+    return map;
+  }, [pendingIssues]);
 
   const baseView = useMemo(() => buildBaseView(paras.base, diffB, diffL), [paras, diffB, diffL]);
   const brandView = useMemo(() => buildSideView(paras.brand, diffB, 'brand'), [paras, diffB]);
@@ -140,11 +174,44 @@ export default function App() {
     [refToEntry, scrollToEntry],
   );
 
+  // —— 事实问题选择与四栏联动 ——
+  const [activeIssueId, setActiveIssueId] = useState<string | null>(null);
+  const activeIssue = useMemo(
+    () => factReport.issues.find((i) => i.id === activeIssueId) ?? null,
+    [factReport, activeIssueId],
+  );
+  const factLinkedIds = useMemo(
+    () => (activeIssue ? new Set(activeIssue.entryIds) : undefined),
+    [activeIssue],
+  );
+  const entryLabel = useCallback(
+    (entryId: string) => {
+      const entry = entries.find((e) => e.id === entryId);
+      return entry ? refsLabel(entry.refs) : '';
+    },
+    [entries],
+  );
+  const selectIssue = useCallback(
+    (issue: FactIssue) => {
+      setActiveIssueId(issue.id);
+      setSelectedEntryId(issue.primaryEntryId);
+      scrollToEntry(issue.primaryEntryId);
+    },
+    [scrollToEntry],
+  );
+  const locateEntry = useCallback(
+    (entryId: string) => {
+      setSelectedEntryId(entryId);
+      scrollToEntry(entryId);
+    },
+    [scrollToEntry],
+  );
+
   // —— 操作 ——
   const resolve = useCallback(
     (conflictId: string, resolution: Resolution) => {
       commitState({
-        docs: state.docs,
+        ...state,
         resolutions: { ...state.resolutions, [conflictId]: resolution },
       });
     },
@@ -155,31 +222,75 @@ export default function App() {
     (conflictId: string) => {
       const next = { ...state.resolutions };
       delete next[conflictId];
-      commitState({ docs: state.docs, resolutions: next });
+      commitState({ ...state, resolutions: next });
     },
     [commitState, state],
   );
 
-  const saveDoc = useCallback(
-    (which: keyof Docs, text: string) => {
-      const docs = { ...state.docs, [which]: text };
-      // 文档变化后，清理已不存在的冲突的解决记录
+  /** 文档变更的统一入口：重新合并并清理失效决议。 */
+  const commitDocs = useCallback(
+    (docs: Docs, acksNext: Record<string, string>) => {
       const fresh = mergeDocuments(
         splitParagraphs(docs.base),
         splitParagraphs(docs.brand),
         splitParagraphs(docs.legal),
         {},
       );
-      commitState({ docs, resolutions: sanitizeResolutions(fresh, state.resolutions) });
+      commitState({ docs, resolutions: sanitizeResolutions(fresh, state.resolutions), acks: acksNext });
+    },
+    [commitState, state],
+  );
+
+  const saveDoc = useCallback(
+    (which: keyof Docs, text: string) => {
+      commitDocs({ ...state.docs, [which]: text }, state.acks);
+    },
+    [commitDocs, state],
+  );
+
+  // 采用同步更新候选：写回来源版本后自动重新合并、重新验证全部关系
+  const applyCandidate = useCallback(
+    (_issue: FactIssue, cand: SyncCandidate) => {
+      if (cand.locked) return; // 法务锁定段落不自动改写
+      const next = applyCandidateToDocs(state.docs, entries, cand);
+      if (!next) return;
+      commitDocs(next, state.acks);
+      setActiveIssueId(null);
+    },
+    [commitDocs, entries, state],
+  );
+
+  const ackIssue = useCallback(
+    (issue: FactIssue) => {
+      commitState({ ...state, acks: { ...state.acks, [issue.ackKey]: issue.signature } });
+    },
+    [commitState, state],
+  );
+
+  const unackIssue = useCallback(
+    (issue: FactIssue) => {
+      const next = { ...state.acks };
+      delete next[issue.ackKey];
+      commitState({ ...state, acks: next });
     },
     [commitState, state],
   );
 
   const resetSample = useCallback(() => {
     if (window.confirm('恢复内置示例？当前的文档修改与冲突解决记录将被清除。')) {
-      commitState({ docs: SAMPLE_DOCS, resolutions: {} });
+      commitState({ docs: SAMPLE_DOCS, resolutions: {}, acks: {} });
       setActiveConflictId(null);
       setSelectedEntryId(null);
+      setActiveIssueId(null);
+    }
+  }, [commitState]);
+
+  const loadFactSample = useCallback(() => {
+    if (window.confirm('载入事实校核示例？当前的文档修改与冲突解决记录将被清除。')) {
+      commitState({ docs: SAMPLE_FACTS_DOCS, resolutions: {}, acks: {} });
+      setActiveConflictId(null);
+      setSelectedEntryId(null);
+      setActiveIssueId(null);
     }
   }, [commitState]);
 
@@ -227,6 +338,10 @@ export default function App() {
     window.setTimeout(() => setCopied(false), 2000);
   }, [entries]);
 
+  const scrollToFactPanel = useCallback(() => {
+    document.getElementById('fact-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }, []);
+
   const activeIndex = activeConflictId ? navTargets.indexOf(activeConflictId) : -1;
   const progress = navTargets.length === 0 ? 1 : summary.resolved / navTargets.length;
 
@@ -235,7 +350,7 @@ export default function App() {
       <header className="topbar">
         <div className="topbar-title">
           <h1>联合改稿工作台</h1>
-          <span className="subtitle">底稿 · 品牌版 · 法务版 三方段落合并（本地自动保存）</span>
+          <span className="subtitle">底稿 · 品牌版 · 法务版 三方段落合并 + 承诺事实校核（本地自动保存）</span>
         </div>
         <div className="toolbar">
           <div className="conflict-nav" role="group" aria-label="冲突导航">
@@ -261,6 +376,15 @@ export default function App() {
             </div>
           </div>
 
+          <button
+            type="button"
+            className={`status-pill status-pill-btn ${pendingIssues.length > 0 ? 'status-fact' : 'status-resolved'}`}
+            onClick={scrollToFactPanel}
+            title="承诺事实与交叉引用校核"
+          >
+            {pendingIssues.length > 0 ? `⚖ 事实冲突 ${pendingIssues.length}` : '✓ 事实校核通过'}
+          </button>
+
           <div className="toolbar-group">
             <button type="button" className="btn btn-ghost" onClick={doUndo} disabled={!canUndo(history)} title="撤销 (Ctrl+Z)">
               ↩ 撤销
@@ -273,6 +397,9 @@ export default function App() {
           <div className="toolbar-group">
             <button type="button" className="btn btn-ghost" onClick={resetSample}>
               恢复示例
+            </button>
+            <button type="button" className="btn btn-ghost" onClick={loadFactSample}>
+              事实校核示例
             </button>
             <button type="button" className="btn btn-primary" onClick={copyResult}>
               {copied ? '✓ 已复制' : '复制合并稿'}
@@ -288,7 +415,8 @@ export default function App() {
         <span className="legend-item"><span className="badge tone-muted"><span className="badge-icon">＋</span>新增</span></span>
         <span className="legend-item"><span className="badge tone-muted"><span className="badge-icon">✕</span>删除</span></span>
         <span className="legend-item"><span className="badge tone-muted"><span className="badge-icon">⇄</span>移动</span></span>
-        <span className="legend-item"><span className="badge tone-warn"><span className="badge-icon">⚠︎</span>待处理冲突</span></span>
+        <span className="legend-item"><span className="badge tone-warn"><span className="badge-icon">⚠︎</span>文本合并冲突</span></span>
+        <span className="legend-item"><span className="badge tone-fact"><span className="badge-icon">⚖</span>事实完整性冲突</span></span>
         <span className="legend-item"><span className="badge tone-ok"><span className="badge-icon">✓</span>已解决</span></span>
         <span className="legend-item legend-diff"><del>删除内容</del> / <ins>新增内容</ins>（相对底稿）</span>
         <label className="legend-item legend-toggle">
@@ -300,6 +428,19 @@ export default function App() {
           显示已删除段落（{summary.deleted}）
         </label>
       </div>
+
+      <FactPanel
+        report={factReport}
+        pending={pendingIssues}
+        acked={ackedIssues}
+        activeIssueId={activeIssueId}
+        entryLabel={entryLabel}
+        onSelectIssue={selectIssue}
+        onLocateEntry={locateEntry}
+        onApplyCandidate={applyCandidate}
+        onAck={ackIssue}
+        onUnack={unackIssue}
+      />
 
       <main className="board">
         <SourcePane
@@ -336,6 +477,8 @@ export default function App() {
           selectedEntryId={selectedEntryId}
           showDeleted={showDeleted}
           baseLength={paras.base.length}
+          factLinkedIds={factLinkedIds}
+          entryIssueCount={entryIssueCount}
           onSelect={setSelectedEntryId}
           onResolve={resolve}
           onUnresolve={unresolve}

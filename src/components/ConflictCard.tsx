@@ -9,12 +9,16 @@ interface ConflictCardProps {
   order: number;
   active: boolean;
   selected: boolean;
+  /** 属于当前选中事实问题的受影响条目。 */
+  factLinked?: boolean;
+  /** 该条目涉及的待处理事实问题提示。 */
+  factNote?: string;
   onSelect: () => void;
   onResolve: (resolution: Resolution) => void;
 }
 
 /** 待处理冲突卡片：并列展示各方版本，提供四种解决方式。 */
-export function ConflictCard({ conflict, order, active, selected, onSelect, onResolve }: ConflictCardProps) {
+export function ConflictCard({ conflict, order, active, selected, factLinked, factNote, onSelect, onResolve }: ConflictCardProps) {
   const [manual, setManual] = useState(false);
   const [draft, setDraft] = useState('');
 
@@ -28,6 +32,7 @@ export function ConflictCard({ conflict, order, active, selected, onSelect, onRe
     'conflict-card',
     active ? 'nav-active' : '',
     selected ? 'selected' : '',
+    factLinked ? 'fact-linked' : '',
   ]
     .filter(Boolean)
     .join(' ');
@@ -45,6 +50,7 @@ export function ConflictCard({ conflict, order, active, selected, onSelect, onRe
         </span>
         <strong>冲突 #{order} · {conflictTypeLabel(conflict.type)}</strong>
         <span className="status-pill status-pending">待处理</span>
+        {factNote && <span className="fact-note">{factNote}</span>}
         {conflict.move && (
           <span className="move-note">
             ⇄ 涉及段落移动（底稿第 {conflict.move.fromBase + 1} 段）

@@ -12,6 +12,10 @@ interface MergedPaneProps {
   selectedEntryId: string | null;
   showDeleted: boolean;
   baseLength: number;
+  /** 当前选中事实问题涉及的条目（四栏联动高亮）。 */
+  factLinkedIds?: Set<string>;
+  /** 条目 id → 待处理事实问题数。 */
+  entryIssueCount?: Map<string, number>;
   onSelect: (entryId: string) => void;
   onResolve: (conflictId: string, resolution: Resolution) => void;
   onUnresolve: (conflictId: string) => void;
@@ -40,8 +44,11 @@ export function MergedPane(props: MergedPaneProps) {
 }
 
 function EntryCard(props: MergedPaneProps & { entry: MergeEntry }) {
-  const { entry, conflictOrder, activeConflictId, selectedEntryId, onSelect, onResolve, onUnresolve, baseLength } = props;
+  const { entry, conflictOrder, activeConflictId, selectedEntryId, onSelect, onResolve, onUnresolve, baseLength, factLinkedIds, entryIssueCount } = props;
   const selected = selectedEntryId === entry.id;
+  const factLinked = factLinkedIds?.has(entry.id) ?? false;
+  const issueCount = entryIssueCount?.get(entry.id) ?? 0;
+  const factNote = issueCount > 0 ? `⚖ 事实冲突 ${issueCount}` : undefined;
 
   if (entry.kind === 'conflict') {
     return (
@@ -50,6 +57,8 @@ function EntryCard(props: MergedPaneProps & { entry: MergeEntry }) {
         order={conflictOrder.get(entry.id) ?? 0}
         active={activeConflictId === entry.id}
         selected={selected}
+        factLinked={factLinked}
+        factNote={factNote}
         onSelect={() => onSelect(entry.id)}
         onResolve={(res) => onResolve(entry.id, res)}
       />
@@ -57,7 +66,7 @@ function EntryCard(props: MergedPaneProps & { entry: MergeEntry }) {
   }
 
   if (entry.kind === 'deleted') {
-    return <DeletedCard entry={entry} selected={selected} onSelect={() => onSelect(entry.id)} onUnresolve={onUnresolve} />;
+    return <DeletedCard entry={entry} selected={selected} factLinked={factLinked} factNote={factNote} onSelect={() => onSelect(entry.id)} onUnresolve={onUnresolve} />;
   }
 
   return (
@@ -66,6 +75,8 @@ function EntryCard(props: MergedPaneProps & { entry: MergeEntry }) {
       order={entry.resolution ? conflictOrder.get(entry.id) : undefined}
       active={activeConflictId === entry.id}
       selected={selected}
+      factLinked={factLinked}
+      factNote={factNote}
       baseLength={baseLength}
       onSelect={() => onSelect(entry.id)}
       onUnresolve={onUnresolve}
@@ -78,6 +89,8 @@ function ItemCard({
   order,
   active,
   selected,
+  factLinked,
+  factNote,
   baseLength,
   onSelect,
   onUnresolve,
@@ -86,6 +99,8 @@ function ItemCard({
   order?: number;
   active: boolean;
   selected: boolean;
+  factLinked: boolean;
+  factNote?: string;
   baseLength: number;
   onSelect: () => void;
   onUnresolve: (id: string) => void;
@@ -96,6 +111,7 @@ function ItemCard({
     resolved ? 'resolved-card' : '',
     active ? 'nav-active' : '',
     selected ? 'selected' : '',
+    factLinked ? 'fact-linked' : '',
   ]
     .filter(Boolean)
     .join(' ');
@@ -121,6 +137,7 @@ function ItemCard({
             ⇄ 自底稿第 {item.move.fromBase + 1} 段移至{anchorLabel(item.move.anchor, baseLength)}
           </span>
         )}
+        {factNote && <span className="fact-note">{factNote}</span>}
         {resolved && (
           <button
             type="button"
@@ -147,24 +164,29 @@ function ItemCard({
 function DeletedCard({
   entry,
   selected,
+  factLinked,
+  factNote,
   onSelect,
   onUnresolve,
 }: {
   entry: DeletedItem;
   selected: boolean;
+  factLinked: boolean;
+  factNote?: string;
   onSelect: () => void;
   onUnresolve: (id: string) => void;
 }) {
   const byLabel = entry.by === 'both' ? '双方' : entry.by === 'brand' ? '品牌' : '法务';
   return (
     <article
-      className={`entry-card deleted-card${selected ? ' selected' : ''}`}
+      className={`entry-card deleted-card${selected ? ' selected' : ''}${factLinked ? ' fact-linked' : ''}`}
       id={`entry-${entry.id}`}
       onClick={onSelect}
     >
       <header className="entry-head">
         <span className="delete-flag" aria-label="已删除">✕</span>
         <strong>{byLabel}删除{entry.resolution ? '（经人工确认）' : ''}</strong>
+        {factNote && <span className="fact-note">{factNote}</span>}
         {entry.resolution && (
           <button
             type="button"

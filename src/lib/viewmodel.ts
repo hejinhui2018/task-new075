@@ -4,6 +4,7 @@
 
 import type { ParaDiff } from './diff';
 import type { Origin, Side } from './merge';
+import type { IssueKind, Severity } from './verify';
 
 export type Tone = 'base' | 'brand' | 'legal' | 'warn' | 'ok' | 'muted';
 
@@ -138,6 +139,38 @@ export function resolutionLabel(choice: 'brand' | 'legal' | 'base' | 'custom'): 
       return '手动填写';
   }
 }
+
+// —— 事实完整性校核 ——
+
+export const ISSUE_KIND_LABEL: Record<IssueKind, string> = {
+  'value-mismatch': '口径不一致',
+  'sum-mismatch': '合计不符',
+  'date-order': '日期顺序矛盾',
+  'ratio-range': '比例越界',
+  'ref-stale': '引用目标漂移',
+  'ref-broken': '引用目标已删除',
+  'ref-unresolved': '引用无法解析',
+  'footnote-dangling': '脚注缺失',
+  'footnote-orphan': '脚注未被引用',
+};
+
+export const ISSUE_KIND_ICON: Record<IssueKind, string> = {
+  'value-mismatch': '⚖',
+  'sum-mismatch': '🧮',
+  'date-order': '📅',
+  'ratio-range': '📊',
+  'ref-stale': '🔗',
+  'ref-broken': '🔗',
+  'ref-unresolved': '🔗',
+  'footnote-dangling': '※',
+  'footnote-orphan': '※',
+};
+
+export const SEVERITY_LABEL: Record<Severity, string> = {
+  error: '需处理',
+  warn: '警告',
+  info: '提示',
+};
 
 /** 合并条目的来源引用文字，如「底稿 §3 · 品牌 §3 · 法务 §4」。 */
 export function refsLabel(refs: { base?: number; brand?: number; legal?: number }): string {
