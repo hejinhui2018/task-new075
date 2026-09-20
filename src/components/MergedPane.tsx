@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react';
 import type { DeletedItem, MergeEntry, MergedItem, Resolution } from '../lib/merge';
 import { anchorLabel, originBadges, refsLabel, resolutionLabel } from '../lib/viewmodel';
 import { BadgeRow } from './Badge';
@@ -15,11 +16,13 @@ interface MergedPaneProps {
   onSelect: (entryId: string) => void;
   onResolve: (conflictId: string, resolution: Resolution) => void;
   onUnresolve: (conflictId: string) => void;
+  /** 事实完整性校核面板（渲染在条目列表上方）。 */
+  factPanel?: ReactNode;
 }
 
 /** 合并结果栏。 */
 export function MergedPane(props: MergedPaneProps) {
-  const { entries, showDeleted } = props;
+  const { entries, showDeleted, factPanel } = props;
   return (
     <section className="pane pane-merged" aria-label="合并结果">
       <header className="pane-header">
@@ -29,6 +32,7 @@ export function MergedPane(props: MergedPaneProps) {
           <span className="pane-count">{entries.length} 条</span>
         </div>
       </header>
+      {factPanel}
       <div className="entry-list">
         {entries.map((entry) => {
           if (entry.kind === 'deleted' && !showDeleted) return null;

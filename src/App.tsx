@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { buildFactModel, diffBaseline, snapshotBaseline, validateFacts, type FactIssue } from './lib/checks';
 import { diffParagraphs } from './lib/diff';
 import { canRedo, canUndo, commit, initHistory, redo, undo, type History } from './lib/history';
 import {
@@ -8,38 +9,54 @@ import {
   summarize,
   type Resolution,
 } from './lib/merge';
+import { applyCandidate, buildSyncCandidates, type SyncCandidate } from './lib/propagate';
 import { SAMPLE_DOCS } from './lib/sample';
-import { loadState, saveState } from './lib/storage';
+import {
+  loadState,
+  saveState,
+  PERSISTED_HISTORY_LIMIT,
+  type Docs,
+  type PersistedState,
+  type WorkSnapshot,
+} from './lib/storage';
 import { splitParagraphs } from './lib/text';
 import { buildBaseView, buildSideView } from './lib/viewmodel';
+import { FactPanel } from './components/FactPanel';
 import { MergedPane } from './components/MergedPane';
 import { SourcePane } from './components/SourcePane';
 
-interface Docs {
-  base: string;
-  brand: string;
-  legal: string;
-}
+type WorkState = WorkSnapshot;
 
-interface WorkState {
-  docs: Docs;
-  resolutions: Record<string, Resolution>;
-}
-
-function initialState(): WorkState {
+function initialHistory(): History<WorkState> {
   const persisted = loadState();
-  if (persisted) return { docs: persisted.docs, resolutions: persisted.resolutions };
-  return { docs: SAMPLE_DOCS, resolutions: {} };
+  if (persisted) {
+    const present: WorkState = {
+      docs: persisted.docs,
+      resolutions: persisted.resolutions,
+      factResolutions: persisted.factResolutions,
+      baseline: persisted.baseline,
+    };
+    return { past: persisted.history.past, present, future: persisted.history.future };
+  }
+  return initHistory({ docs: SAMPLE_DOCS, resolutions: {}, factResolutions: {}, baseline: null });
 }
 
 export default function App() {
-  const [history, setHistory] = useState<History<WorkState>>(() => initHistory(initialState()));
+  const [history, setHistory] = useState<History<WorkState>>(initialHistory);
   const state = history.present;
 
-  // 本地持久化
+  // 本地持久化：文档、决议、事实决议、比较基线，以及撤销/重做历史
   useEffect(() => {
-    saveState(state);
-  }, [state]);
+    const persisted: PersistedState = {
+      version: 2,
+      ...state,
+      history: {
+        past: history.past.slice(-PERSISTED_HISTORY_LIMIT),
+        future: history.future.slice(0, PERSISTED_HISTORY_LIMIT),
+      },
+    };
+    saveState(persisted);
+  }, [history, state]);
 
   const commitState = useCallback((next: WorkState) => {
     setHistory((h) => commit(h, next));
@@ -61,6 +78,25 @@ export default function App() {
     [paras, state.resolutions],
   );
   const summary = useMemo(() => summarize(entries), [entries]);
+
+  // —— 事实完整性校核：抽取 → 身份 → 验证 → 同步候选 ——
+  const factModel = useMemo(
+    () => buildFactModel(paras.base, paras.brand, paras.legal, diffB, diffL, entries),
+    [paras, diffB, diffL, entries],
+  );
+  const factIssues = useMemo(() => validateFacts(factModel), [factModel]);
+  const syncCandidates = useMemo(
+    () => buildSyncCandidates(factIssues, factModel, { brand: paras.brand, legal: paras.legal }),
+    [factIssues, factModel, paras],
+  );
+  const pendingFactCount = useMemo(
+    () => factIssues.filter((i) => !state.factResolutions[i.id]).length,
+    [factIssues, state.factResolutions],
+  );
+  const baselineChanged = useMemo(
+    () => (state.baseline ? diffBaseline(factModel, state.baseline).size : 0),
+    [factModel, state.baseline],
+  );
 
   const baseView = useMemo(() => buildBaseView(paras.base, diffB, diffL), [paras, diffB, diffL]);
   const brandView = useMemo(() => buildSideView(paras.brand, diffB, 'brand'), [paras, diffB]);
@@ -140,13 +176,29 @@ export default function App() {
     [refToEntry, scrollToEntry],
   );
 
+  // —— 事实冲突定位：联动四栏（合并条目 + 三个来源栏） ——
+  const [activeIssueId, setActiveIssueId] = useState<string | null>(null);
+  const locateIssue = useCallback(
+    (issue: FactIssue) => {
+      setActiveIssueId(issue.id);
+      for (const loc of issue.locations) {
+        if (loc.doc === 'merged' && loc.entryId) {
+          setSelectedEntryId(loc.entryId);
+          scrollToEntry(loc.entryId);
+        } else if (loc.doc !== 'merged') {
+          document
+            .getElementById(`src-${loc.doc}-${loc.paraIndex}`)
+            ?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+      }
+    },
+    [scrollToEntry],
+  );
+
   // —— 操作 ——
   const resolve = useCallback(
     (conflictId: string, resolution: Resolution) => {
-      commitState({
-        docs: state.docs,
-        resolutions: { ...state.resolutions, [conflictId]: resolution },
-      });
+      commitState({ ...state, resolutions: { ...state.resolutions, [conflictId]: resolution } });
     },
     [commitState, state],
   );
@@ -155,7 +207,7 @@ export default function App() {
     (conflictId: string) => {
       const next = { ...state.resolutions };
       delete next[conflictId];
-      commitState({ docs: state.docs, resolutions: next });
+      commitState({ ...state, resolutions: next });
     },
     [commitState, state],
   );
@@ -170,16 +222,44 @@ export default function App() {
         splitParagraphs(docs.legal),
         {},
       );
-      commitState({ docs, resolutions: sanitizeResolutions(fresh, state.resolutions) });
+      commitState({ ...state, docs, resolutions: sanitizeResolutions(fresh, state.resolutions) });
     },
     [commitState, state],
   );
 
+  // 采用同步候选：修改对应来源文档（法务锁定段落已被 applyCandidate 拒绝），全部关系随之重新验证
+  const applySync = useCallback(
+    (candidate: SyncCandidate) => {
+      const nextText = applyCandidate(state.docs[candidate.doc], candidate);
+      if (nextText !== state.docs[candidate.doc]) saveDoc(candidate.doc, nextText);
+    },
+    [saveDoc, state.docs],
+  );
+
+  const acknowledgeIssue = useCallback(
+    (issueId: string) => {
+      commitState({
+        ...state,
+        factResolutions: { ...state.factResolutions, [issueId]: { choice: 'acknowledged' } },
+      });
+    },
+    [commitState, state],
+  );
+
+  const setBaseline = useCallback(() => {
+    commitState({ ...state, baseline: snapshotBaseline(factModel, new Date().toISOString()) });
+  }, [commitState, state, factModel]);
+
+  const clearBaseline = useCallback(() => {
+    commitState({ ...state, baseline: null });
+  }, [commitState, state]);
+
   const resetSample = useCallback(() => {
     if (window.confirm('恢复内置示例？当前的文档修改与冲突解决记录将被清除。')) {
-      commitState({ docs: SAMPLE_DOCS, resolutions: {} });
+      commitState({ docs: SAMPLE_DOCS, resolutions: {}, factResolutions: {}, baseline: null });
       setActiveConflictId(null);
       setSelectedEntryId(null);
+      setActiveIssueId(null);
     }
   }, [commitState]);
 
@@ -235,7 +315,7 @@ export default function App() {
       <header className="topbar">
         <div className="topbar-title">
           <h1>联合改稿工作台</h1>
-          <span className="subtitle">底稿 · 品牌版 · 法务版 三方段落合并（本地自动保存）</span>
+          <span className="subtitle">底稿 · 品牌版 · 法务版 三方段落合并 + 承诺事实校核（本地自动保存）</span>
         </div>
         <div className="toolbar">
           <div className="conflict-nav" role="group" aria-label="冲突导航">
@@ -254,12 +334,19 @@ export default function App() {
 
           <div className="progress-block" title={`已解决 ${summary.resolved} 处，待处理 ${summary.unresolved} 处`}>
             <span className={`status-pill ${summary.unresolved > 0 ? 'status-pending' : 'status-resolved'}`}>
-              {summary.unresolved > 0 ? `待处理 ${summary.unresolved}` : '全部解决'}
+              {summary.unresolved > 0 ? `文本冲突 ${summary.unresolved}` : '文本冲突已解决'}
             </span>
             <div className="progress-track" aria-hidden="true">
               <div className="progress-fill" style={{ width: `${Math.round(progress * 100)}%` }} />
             </div>
           </div>
+
+          <span
+            className={`status-pill ${pendingFactCount > 0 ? 'status-fact' : 'status-resolved'}`}
+            title="事实完整性冲突：金额/日期/比例/脚注/引用的跨段矛盾"
+          >
+            {pendingFactCount > 0 ? `事实冲突 ${pendingFactCount}` : '事实校核通过'}
+          </span>
 
           <div className="toolbar-group">
             <button type="button" className="btn btn-ghost" onClick={doUndo} disabled={!canUndo(history)} title="撤销 (Ctrl+Z)">
@@ -288,7 +375,8 @@ export default function App() {
         <span className="legend-item"><span className="badge tone-muted"><span className="badge-icon">＋</span>新增</span></span>
         <span className="legend-item"><span className="badge tone-muted"><span className="badge-icon">✕</span>删除</span></span>
         <span className="legend-item"><span className="badge tone-muted"><span className="badge-icon">⇄</span>移动</span></span>
-        <span className="legend-item"><span className="badge tone-warn"><span className="badge-icon">⚠︎</span>待处理冲突</span></span>
+        <span className="legend-item"><span className="badge tone-warn"><span className="badge-icon">⚠︎</span>文本冲突</span></span>
+        <span className="legend-item"><span className="badge tone-fact"><span className="badge-icon">⚖</span>事实冲突</span></span>
         <span className="legend-item"><span className="badge tone-ok"><span className="badge-icon">✓</span>已解决</span></span>
         <span className="legend-item legend-diff"><del>删除内容</del> / <ins>新增内容</ins>（相对底稿）</span>
         <label className="legend-item legend-toggle">
@@ -339,6 +427,21 @@ export default function App() {
           onSelect={setSelectedEntryId}
           onResolve={resolve}
           onUnresolve={unresolve}
+          factPanel={
+            <FactPanel
+              issues={factIssues}
+              candidates={syncCandidates}
+              resolutions={state.factResolutions}
+              baseline={state.baseline}
+              baselineChanged={baselineChanged}
+              activeIssueId={activeIssueId}
+              onLocate={locateIssue}
+              onApplyCandidate={applySync}
+              onAcknowledge={acknowledgeIssue}
+              onSetBaseline={setBaseline}
+              onClearBaseline={clearBaseline}
+            />
+          }
         />
       </main>
     </div>
